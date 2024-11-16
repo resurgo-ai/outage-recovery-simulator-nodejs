@@ -1,0 +1,6 @@
+.*
+!.gitignore
+!.github
+*.log
+node_modules
+package-lock.json
