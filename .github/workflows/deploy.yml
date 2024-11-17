@@ -1,0 +1,194 @@
+name: Resurgo.AI - Outage Recovery Simulator
+
+on:
+  push:
+    branches:
+      - main
+jobs:
+  validate-repository:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Declare RCA skipped - forced push
+        id: forced-push
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const errors = [];
+            if (context.payload.forced) {
+              errors.push(
+                `Root Cause Analysis (RCA) is skipped due to a forced push. Please use a regular push to enable RCA.`
+              );
+            }
+            if (context.payload.repository.private) {
+              errors.push(
+                `RCA workflow unavailable for private repositories. Set the repository to 'Public' and re-merge changes to enable RCA.`
+              );
+            }
+            if (${{github.run_attempt}} > 1) {
+              errors.push(
+                `This is a re-run #${{github.run_attempt}}. RCA workflow unavailable for workflow re-runs on the same commit sha.`
+              );
+            }
+
+            if (errors.length == 0) {
+              process.exit(0);
+            }
+
+            await github.rest.repos.createCommitComment({
+              ...context.repo,
+              commit_sha: context.sha,
+              body: `**Resurgo.AI:** ⚠️  the following errors prevented RCA:\n\n\n\n` + errors.join("\n\n")
+            });
+
+            console.error(errors);
+
+            await core.summary
+              .addHeading('⚠️  RCA initiation failed')
+              .addRaw(errors.join("\n\n"))
+              .addRaw("\n\nNo further actions will be taken for this deployment.")
+              .write();
+
+            process.exit(1);
+
+  deploy:
+    needs: validate-repository
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    outputs:
+      artifact-url: ${{ steps.artifact-upload-step.outputs.artifact-url }}
+    steps:
+
+      - name: Add commit comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createCommitComment({
+              ...context.repo,
+              commit_sha: context.sha,
+              body: `**Resurgo.AI:** Deployment in progress. Stay tuned for updates.`
+            });
+
+      - name: Checkout code in 'before' state
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.before }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/Jod'
+
+      - name: Simulate load before deploy
+        run: |
+          echo "Log for deploy ${{ github.event.before }}..${{ github.event.after }}" > app.log
+          npm install
+          npx mocha tests/user.test.js # writes logs for 50..100 requests to app.log
+          mv app.log ..
+
+      - name: Checkout code in 'afer' state
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.after }}
+
+      - name: Simulate load after deploy
+        run: |
+          npm install
+          mv ../app.log .
+          npx mocha tests/user.test.js # writes logs for 50..100 requests to app.log
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        id: artifact-upload-step
+        with:
+          name: Resurgo.AI-log-${{github.run_id}}-${{github.run_attempt}}
+          path: app.log
+
+      - name: Deploy Error Handler
+        id: deploy-error-handler
+        if: failure() && !cancelled()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.setOutput('happened', 'true');
+            await github.rest.repos.createCommitComment({
+              ...context.repo,
+              commit_sha: context.sha,
+              body: `**Resurgo.AI:**\n\n` +
+                    `A critical error occurred during deployment, preventing RCA.\n\n` +
+                    `Recommended actions:\n\n` +
+                    ` * Review the [workflow run logs](https://github.com/${context.repository}/actions/runs/${context.run_id}) for details.\n` +
+                    ` * Address any issues introduced in this deployment.\n` +
+                    ` * Push a corrected changeset.`
+            });
+
+            await core.summary
+              .addHeading('⚠️. A critical error occurred during deployment')
+              .addRaw("No further actions will be taken for this deployment.")
+              .write();
+
+            process.exit(1);
+
+  root-cause-analys:
+    needs: deploy
+    permissions:
+      contents: write
+      id-token: write
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Notify Resurgo orchestrator
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const audience = 'https://resurgo.ai';
+            const id_token = await core.getIDToken(audience);
+            const response = await fetch('https://github.resurgo.ai/workflow', {
+              method: "POST",
+              headers: {
+                "Authorization": `Bearer ${id_token}`,
+                "X-Resurgo-Api-Version": "2024-11-17"
+              }
+            });
+
+            if (!response.ok) {
+              console.error(`Failed to initiate the Resurgo.AI workflow. Error ${response.status}: ${response.statusText}.`);
+              process.exit(1);
+            }
+
+      - name: Add commit comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createCommitComment({
+              ...context.repo,
+              commit_sha: context.sha,
+              body: `**Resurgo.AI:**\n\n` +
+                    `Logs uploaded as [Resurgo.AI-log-${{github.run_id}}-${{github.run_attempt}}](${{ needs.deploy.outputs.artifact-url }}).\n\n` +
+                    `Orchestrator notified. Awaiting worker assignment.`
+            });
+            await core.summary
+              .addHeading('RCA initiated successfully')
+              .addRaw('Proggress updates and results will appear as comments under the last pushed commit: ')
+              .addLink(context.sha, context.payload.head_commit.url)
+              .write();
+
+      - name: RCA Error Handler
+        if: failure() && !cancelled() && steps.deploy-error-handler.outputs.happened != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createCommitComment({
+              ...context.repo,
+              commit_sha: context.sha,
+              body: `**Resurgo.AI:**\n\n` +
+                    `A critical error occurred while initiating Root Cause Analysis (RCA).\n\n` +
+                    `No further actions will be taken for this deployment.`
+            });
+            await core.summary
+              .addHeading('⚠️. RCA initiation failed')
+              .addRaw('A critical error occurred while initiating Root Cause Analysis (RCA).\n\n')
+              .addRaw('No further actions will be taken for this deployment.')
+              .write();
+            process.exit(1);
