@@ -1,1 +1,2 @@
-DATABASE: db.sqlite
+DATABASE: db.sqlitex
+HOSTNAME: example.resurgo.ai
